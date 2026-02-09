@@ -1,7 +1,40 @@
-import { GoogleGenAI, LiveServerMessage, Modality } from '@google/genai';
+import { GoogleGenAI, LiveServerMessage, Modality, Type, FunctionDeclaration } from '@google/genai';
 import { DiagnosisStatus, MedicalAlert } from '../types';
 
-// The system prompt for Lazarus
+// Tool Definition for structured output
+const REPORT_TOOL: FunctionDeclaration = {
+  name: "report_medical_status",
+  description: "Report the current medical status and diagnosis based on the patient's condition.",
+  parameters: {
+    type: Type.OBJECT,
+    properties: {
+      status: { 
+        type: Type.STRING, 
+        enum: ["NORMAL", "WARNING", "CRITICAL"],
+        description: "The triage status of the patient."
+      },
+      diagnosis: { 
+        type: Type.STRING,
+        description: "The specific medical diagnosis (e.g., Stroke, Cardiac Arrest)."
+      },
+      confidence: { 
+        type: Type.NUMBER,
+        description: "Confidence score between 0.0 and 1.0."
+      },
+      symptoms: { 
+        type: Type.ARRAY, 
+        items: { type: Type.STRING },
+        description: "List of observed symptoms."
+      },
+      cpr_feedback: { 
+        type: Type.STRING,
+        description: "CPR instructions if applicable (e.g., PUSH FASTER)."
+      }
+    },
+    required: ["status", "diagnosis", "confidence", "symptoms"]
+  }
+};
+
 const LAZARUS_SYSTEM_PROMPT = `
 You are LAZARUS, a highly advanced medical AI guardian.
 Your Input: A continuous stream of audio (from a 911 call) and video frames (of the caller).
@@ -22,31 +55,23 @@ If Status is CARDIAC ARREST:
 6. If no compressions heard, set "cpr_feedback" to "INSTRUCT: START CPR NOW".
 
 Output Rules:
-- You must output a JSON object strictly. 
-- Do NOT output markdown or plain text explanations outside the JSON.
-- JSON Format:
-  {
-    "status": "NORMAL" | "WARNING" | "CRITICAL",
-    "diagnosis": "Possible Stroke" | "Cardiac Arrest" | "Shock" | "Normal",
-    "confidence": 0.0 to 1.0,
-    "symptoms": ["facial droop", "slurred speech", "gasping"],
-    "cpr_feedback": "INSTRUCT: PUSH FASTER"
-  }
+- You must use the 'report_medical_status' tool to report your findings.
+- Report immediately when a condition is detected or changes.
+- Do NOT speak. Only use the tool.
 `;
 
 export class LazarusLiveClient {
   private ai: GoogleGenAI;
   private session: any = null;
   public onAlert: (alert: MedicalAlert) => void;
-  public onConnectionChange: (isConnected: boolean) => void;
+  public onConnectionChange: (isConnected: boolean, error?: string) => void;
   private audioContext: AudioContext | null = null;
   private processor: ScriptProcessorNode | null = null;
   private source: MediaStreamAudioSourceNode | null = null;
-  private textBuffer: string = "";
 
   constructor(
       onAlert: (alert: MedicalAlert) => void,
-      onConnectionChange: (isConnected: boolean) => void
+      onConnectionChange: (isConnected: boolean, error?: string) => void
   ) {
     this.ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
     this.onAlert = onAlert;
@@ -59,12 +84,8 @@ export class LazarusLiveClient {
         model: 'gemini-2.5-flash-native-audio-preview-12-2025',
         config: {
             systemInstruction: LAZARUS_SYSTEM_PROMPT,
-            // CRITICAL: We want TEXT back (JSON), not Audio. 
-            // If we ask for Audio, it will read the JSON syntax out loud.
-            responseModalities: [Modality.TEXT], 
-            speechConfig: {
-            voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } }
-            },
+            responseModalities: [Modality.AUDIO], 
+            tools: [{ functionDeclarations: [REPORT_TOOL] }],
         },
         callbacks: {
             onopen: () => {
@@ -72,115 +93,63 @@ export class LazarusLiveClient {
                 this.onConnectionChange(true);
             },
             onmessage: (msg: LiveServerMessage) => this.handleMessage(msg),
-            onclose: () => {
-                console.log("Lazarus Core: Disconnected");
-                this.onConnectionChange(false);
+            onclose: (event) => {
+                console.log("Lazarus Core: Disconnected", event);
+                this.onConnectionChange(false, "Connection Closed");
             },
             onerror: (err) => {
                 console.error("Lazarus Core Error:", err);
-                this.onConnectionChange(false);
+                this.onConnectionChange(false, err.message || "Unknown Error");
             },
         }
         });
         return this.session;
-    } catch (e) {
+    } catch (e: any) {
         console.error("Failed to connect:", e);
-        this.onConnectionChange(false);
+        this.onConnectionChange(false, e.message || "Connection Failed");
         throw e;
     }
   }
 
   private handleMessage(message: LiveServerMessage) {
-    // Accumulate transcription text
-    const text = message.serverContent?.modelTurn?.parts?.[0]?.text;
-    
-    if (text) {
-      this.textBuffer += text;
-      this.tryParseBuffer();
-    }
-  }
-
-  private tryParseBuffer() {
-    let buffer = this.textBuffer;
-    
-    // Safety: prevent infinite memory growth if model goes rogue
-    if (buffer.length > 5000) {
-        buffer = buffer.slice(-2000);
-    }
-
-    // Try to find a complete JSON object: { ... }
-    let startIndex = buffer.indexOf('{');
-    while (startIndex !== -1) {
-        let braceCount = 0;
-        let endIndex = -1;
-        let inString = false;
-        let escaped = false;
-
-        // Scan for matching closing brace
-        for (let i = startIndex; i < buffer.length; i++) {
-            const char = buffer[i];
-            
-            if (inString) {
-                if (char === '\\' && !escaped) escaped = true;
-                else if (char === '"' && !escaped) inString = false;
-                else escaped = false;
-            } else {
-                if (char === '"') inString = true;
-                else if (char === '{') braceCount++;
-                else if (char === '}') {
-                    braceCount--;
-                    if (braceCount === 0) {
-                        endIndex = i;
-                        break;
-                    }
-                }
-            }
-        }
-
-        if (endIndex !== -1) {
-            // Extracted a potential JSON string
-            const jsonStr = buffer.substring(startIndex, endIndex + 1);
-            
-            // Remove this chunk from the class buffer immediately
-            this.textBuffer = buffer.substring(endIndex + 1);
-            buffer = this.textBuffer; 
-
-            try {
-                // Clean markdown code blocks if present inside the chunk
-                // Enhanced regex to kill 'json' label and backticks anywhere
-                let cleanJson = jsonStr.replace(/```json/gi, "").replace(/```/g, "").trim();
-                const parsed = JSON.parse(cleanJson);
-                
-                if (parsed && parsed.status) {
+    // Handle Tool Calls (Structured Data)
+    if (message.toolCall) {
+        const responses = message.toolCall.functionCalls.map(fc => {
+            if (fc.name === 'report_medical_status') {
+                try {
+                    const args = fc.args as any;
                     this.onAlert({
-                        status: parsed.status as DiagnosisStatus,
-                        diagnosis: parsed.diagnosis || "Unknown Diagnosis",
-                        confidence: parsed.confidence || 0,
-                        symptoms: parsed.symptoms || [],
-                        cpr_feedback: parsed.cpr_feedback,
+                        status: args.status as DiagnosisStatus,
+                        diagnosis: args.diagnosis,
+                        confidence: args.confidence,
+                        symptoms: args.symptoms,
+                        cpr_feedback: args.cpr_feedback,
                         timestamp: Date.now()
                     });
+                } catch (e) {
+                    console.error("Error parsing tool args", e);
                 }
-            } catch (e) {
-                console.warn("Lazarus Core: JSON Parse failed on extracted chunk", e);
             }
+            // Gemini requires a response to tool calls
+            return {
+                id: fc.id,
+                name: fc.name,
+                response: { result: "ok" }
+            };
+        });
 
-            // Look for next object in remaining buffer
-            startIndex = buffer.indexOf('{');
-        } else {
-            // No matching closing brace yet, wait for more data
-            break;
+        // Send confirmation back to model so it continues monitoring
+        if (this.session) {
+            this.session.sendToolResponse({
+                functionResponses: responses
+            }).catch((e: any) => console.error("Failed to send tool response", e));
         }
     }
-    
-    // Update the class buffer with whatever is left
-    this.textBuffer = buffer;
   }
 
   async startAudioStream(stream: MediaStream) {
     this.audioContext = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
     
-    // Resume context if suspended (browser autoplay policy)
     if (this.audioContext.state === 'suspended') {
         await this.audioContext.resume();
     }
@@ -189,17 +158,20 @@ export class LazarusLiveClient {
     this.processor = this.audioContext.createScriptProcessor(4096, 1, 1);
 
     this.processor.onaudioprocess = (e) => {
+      if (!this.session) return;
+
       const inputData = e.inputBuffer.getChannelData(0);
       const data16 = this.floatTo16BitPCM(inputData);
       
-      if (this.session) {
-         // Using promise.then to avoid blocking the audio thread if send fails
+      try {
          this.session.sendRealtimeInput({
             media: {
                 mimeType: "audio/pcm;rate=16000",
                 data: this.base64Encode(data16)
             }
          });
+      } catch (err) {
+          console.error("Error sending audio chunk", err);
       }
     };
 
@@ -209,16 +181,31 @@ export class LazarusLiveClient {
 
   sendVideoFrame(base64Data: string) {
     if (this.session) {
-      this.session.sendRealtimeInput({
-        media: {
-          mimeType: "image/jpeg",
-          data: base64Data
-        }
-      });
+      try {
+        this.session.sendRealtimeInput({
+            media: {
+            mimeType: "image/jpeg",
+            data: base64Data
+            }
+        });
+      } catch (e) {
+          console.error("Error sending video frame", e);
+      }
     }
   }
 
   disconnect() {
+    // Prevent onclose callback from triggering a "Connection Closed" error state 
+    // when we disconnect intentionally.
+    if (this.session) {
+        // We set session to null first so callbacks know to ignore
+        const tempSession = this.session;
+        this.session = null; 
+        try {
+            tempSession.close();
+        } catch(e) { /* ignore close errors */ }
+    }
+
     if (this.processor) {
         this.processor.disconnect();
         this.processor = null;
@@ -231,8 +218,6 @@ export class LazarusLiveClient {
         this.audioContext.close();
         this.audioContext = null;
     }
-    this.session = null;
-    this.textBuffer = "";
     this.onConnectionChange(false);
   }
 

@@ -5,6 +5,7 @@ export enum DiagnosisStatus {
 }
 
 export interface MedicalAlert {
+  id?: string; // Unique ID for history tracking
   status: DiagnosisStatus;
   diagnosis: string;
   confidence: number;

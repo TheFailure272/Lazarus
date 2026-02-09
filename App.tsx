@@ -6,6 +6,7 @@ import { MedicalAlert, DiagnosisStatus } from './types';
 
 // Mock Alert for demo purposes if API key is missing
 const DEMO_ALERT: MedicalAlert = {
+  id: "demo-1",
   status: DiagnosisStatus.CRITICAL,
   diagnosis: "POSSIBLE STROKE",
   confidence: 0.89,
@@ -16,16 +17,21 @@ const DEMO_ALERT: MedicalAlert = {
 function App() {
   const [isStarted, setIsStarted] = useState(false);
   const [isBooting, setIsBooting] = useState(false);
-  // Connection status tracks the ACTUAL active link, not just user intent
+  // Connection status tracks the ACTUAL active link
   const [isConnected, setIsConnected] = useState(false);
+  const [connectionError, setConnectionError] = useState<string | null>(null);
+  
+  // App State
   const [alert, setAlert] = useState<MedicalAlert | null>(null);
-  const [mode, setMode] = useState<'LIVE_CLIENT' | 'WEBSOCKET_SERVER'>('LIVE_CLIENT');
+  const [history, setHistory] = useState<MedicalAlert[]>([]);
+  const [mode, setMode] = useState<'LIVE_CLIENT' | 'WEBSOCKET_SERVER' | 'SIMULATION'>('LIVE_CLIENT');
   
   // Phantom Replay State
   const [replayUrl, setReplayUrl] = useState<string | null>(null);
   const [replayReason, setReplayReason] = useState<string>("");
   const replayChunksRef = useRef<Blob[]>([]);
   const phantomRecorderRef = useRef<MediaRecorder | null>(null);
+  const recordingMimeTypeRef = useRef<string>(""); // Store the actual mime type used
   const lastAlertTimeRef = useRef<number>(0);
 
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -34,22 +40,99 @@ function App() {
   const wsRef = useRef<WebSocket | null>(null);
   const wsRecorderRef = useRef<MediaRecorder | null>(null);
   
+  // Audio Analysis
+  const [audioAnalyser, setAudioAnalyser] = useState<AnalyserNode | null>(null);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  
   // Reconnect Logic Refs
   const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const isIntentionalStop = useRef(false);
 
-  const startSequence = async () => {
+  const startSequence = async (forceSimulation = false) => {
     setIsBooting(true);
     isIntentionalStop.current = false;
     // Fake boot delay for dramatic effect
     await new Promise(r => setTimeout(r, 1500));
-    await startStream();
+    await startStream(forceSimulation);
     setIsBooting(false);
   };
 
+  const handleNewAlert = (newAlert: MedicalAlert) => {
+      // Add unique ID
+      const alertWithId = { ...newAlert, id: crypto.randomUUID() };
+      setAlert(alertWithId);
+      
+      // Update history (Keep last 10 events)
+      setHistory(prev => {
+          // Avoid duplicate entries if diagnosis is same and timestamp is close (< 2 sec)
+          const last = prev[prev.length - 1];
+          if (last && last.diagnosis === newAlert.diagnosis && (newAlert.timestamp - last.timestamp < 2000)) {
+              return prev;
+          }
+          const updated = [...prev, alertWithId];
+          if (updated.length > 10) updated.shift();
+          return updated;
+      });
+
+      if (newAlert.status === DiagnosisStatus.CRITICAL) {
+          triggerPhantomReplay(alertWithId);
+      }
+  };
+
+  // Create a synthetic stream if hardware access fails
+  const createMockStream = () => {
+    const canvas = document.createElement('canvas');
+    canvas.width = 640;
+    canvas.height = 480;
+    const ctx = canvas.getContext('2d');
+    
+    // Start a visual noise loop
+    if (ctx) {
+        setInterval(() => {
+            ctx.fillStyle = '#050505';
+            ctx.fillRect(0, 0, 640, 480);
+            
+            // Grid
+            ctx.strokeStyle = '#003300';
+            ctx.lineWidth = 1;
+            for(let i=0; i<640; i+=40) { ctx.beginPath(); ctx.moveTo(i,0); ctx.lineTo(i,480); ctx.stroke(); }
+            for(let i=0; i<480; i+=40) { ctx.beginPath(); ctx.moveTo(0,i); ctx.lineTo(640,i); ctx.stroke(); }
+
+            // Noise
+            for(let i=0; i<100; i++) {
+                ctx.fillStyle = `rgba(0, 255, 65, ${Math.random() * 0.3})`;
+                ctx.fillRect(Math.random() * 640, Math.random() * 480, 2, 2);
+            }
+            
+            ctx.fillStyle = '#00ff41';
+            ctx.font = '20px monospace';
+            ctx.fillText("NO CAMERA SIGNAL / SIMULATION MODE", 140, 240);
+        }, 100);
+    }
+    
+    const stream = canvas.captureStream(30);
+    
+    // Add silent audio track to prevent WebAudio crashes
+    try {
+        const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
+        const dest = audioCtx.createMediaStreamDestination();
+        const osc = audioCtx.createOscillator();
+        osc.connect(dest);
+        osc.frequency.value = 0; // Silent
+        osc.start();
+        const audioTrack = dest.stream.getAudioTracks()[0];
+        stream.addTrack(audioTrack);
+    } catch (e) {
+        console.warn("Could not create mock audio track", e);
+    }
+    
+    return stream;
+  };
+
   // Initialize Media Stream
-  const startStream = async () => {
-    if (!process.env.API_KEY && mode === 'LIVE_CLIENT') {
+  const startStream = async (isSimulation: boolean) => {
+    // Skip API check if we are running a simulation
+    if (!process.env.API_KEY && mode === 'LIVE_CLIENT' && !isSimulation) {
         window.alert("Please provide an API Key first (Mocking enabled for now)");
         setAlert(DEMO_ALERT);
         setIsStarted(true);
@@ -58,18 +141,51 @@ function App() {
     }
 
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ 
-        video: { width: 640, height: 480 }, 
-        audio: { 
-            echoCancellation: true,
-            noiseSuppression: true,
-            autoGainControl: true
+      let stream: MediaStream | null = null;
+      try {
+        // Try with ideal constraints first
+        stream = await navigator.mediaDevices.getUserMedia({ 
+            video: { width: { ideal: 640 }, height: { ideal: 480 } }, 
+            audio: { 
+                echoCancellation: true,
+                noiseSuppression: true,
+                autoGainControl: true
+            }
+        });
+      } catch (err) {
+        console.warn("Ideal constraints failed, attempting fallback to basic constraints:", err);
+        try {
+            // Fallback to basic constraints
+            stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+        } catch (err2) {
+            console.warn("Basic constraints failed:", err2);
+            // Final Fallback: Mock Stream
+            console.log("Activating Mock Stream for Fallback");
+            stream = createMockStream();
+            setConnectionError("USING MOCK STREAM (CAMERA FAILED)");
         }
-      });
+      }
       
+      if (!stream) {
+          throw new Error("Failed to initialize any media stream");
+      }
+
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
-        videoRef.current.play();
+        videoRef.current.play().catch(e => console.error("Video play failed", e));
+      }
+
+      // --- SETUP AUDIO ANALYSIS ---
+      try {
+        const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
+        const source = audioCtx.createMediaStreamSource(stream);
+        const analyser = audioCtx.createAnalyser();
+        analyser.fftSize = 256;
+        source.connect(analyser);
+        setAudioAnalyser(analyser);
+        audioContextRef.current = audioCtx;
+      } catch (e) {
+          console.warn("Audio Analysis Setup Failed", e);
       }
 
       setIsStarted(true);
@@ -77,33 +193,84 @@ function App() {
       // Start the Phantom Recorder (Rolling Buffer)
       startPhantomBuffer(stream);
 
-      if (mode === 'LIVE_CLIENT') {
+      if (isSimulation) {
+        runSimulationScript();
+      } else if (mode === 'LIVE_CLIENT') {
         await startLiveClient(stream);
       } else {
         startWebSocketServer(stream);
       }
 
-    } catch (err) {
-      console.error("Error accessing media devices:", err);
+    } catch (err: any) {
+      console.error("Critical Error accessing media devices:", err);
+      setConnectionError(`SYSTEM FAILURE: ${err.message || "Unknown"}`);
       setIsBooting(false);
     }
   };
 
+  const runSimulationScript = () => {
+      console.log("Running Simulation Script...");
+      setIsConnected(true);
+      // Don't clear error if it's the mock stream warning
+      setConnectionError(prev => prev?.includes("MOCK") ? prev : null);
+
+      const scenarios = [
+          { 
+              delay: 1000, 
+              alert: { status: DiagnosisStatus.NORMAL, diagnosis: "VITALS STABLE", confidence: 0.98, symptoms: ["Speech clear", "Gaze steady"], timestamp: Date.now() } 
+          },
+          { 
+              delay: 6000, 
+              alert: { status: DiagnosisStatus.WARNING, diagnosis: "ANOMALY DETECTED", confidence: 0.72, symptoms: ["Mild dysarthria", "Delayed responsiveness"], timestamp: Date.now() } 
+          },
+          { 
+              delay: 12000, 
+              alert: { status: DiagnosisStatus.CRITICAL, diagnosis: "ACUTE STROKE DETECTED", confidence: 0.94, symptoms: ["Left-side facial droop", "Slurred speech (Grade 3)", "Motor asymmetry"], timestamp: Date.now() } 
+          }
+      ];
+
+      scenarios.forEach(step => {
+          setTimeout(() => {
+              handleNewAlert(step.alert);
+          }, step.delay);
+      });
+  };
+
   const startPhantomBuffer = (stream: MediaStream) => {
-    // Record in 1-second chunks to build a rolling buffer
-    const rec = new MediaRecorder(stream, { mimeType: 'video/webm' });
-    
-    rec.ondataavailable = (e) => {
-        if (e.data.size > 0) {
-            replayChunksRef.current.push(e.data);
-            // Keep last 5 seconds (approx 5 chunks)
-            if (replayChunksRef.current.length > 5) {
-                replayChunksRef.current.shift();
-            }
+    try {
+        // Dynamic MIME type detection for cross-browser compatibility
+        let mimeType = '';
+        if (MediaRecorder.isTypeSupported('video/webm;codecs=vp9')) {
+            mimeType = 'video/webm;codecs=vp9';
+        } else if (MediaRecorder.isTypeSupported('video/webm')) {
+            mimeType = 'video/webm';
+        } else if (MediaRecorder.isTypeSupported('video/mp4')) {
+            mimeType = 'video/mp4';
         }
-    };
-    rec.start(1000); 
-    phantomRecorderRef.current = rec;
+        // If mimeType is empty, MediaRecorder will use browser default
+        
+        const options = mimeType ? { mimeType } : undefined;
+        const rec = new MediaRecorder(stream, options);
+        
+        // Save the actual mime type determined by the browser to use for playback
+        recordingMimeTypeRef.current = rec.mimeType;
+        
+        console.log(`Phantom Recorder started with MIME: ${rec.mimeType}`);
+
+        rec.ondataavailable = (e) => {
+            if (e.data.size > 0) {
+                replayChunksRef.current.push(e.data);
+                // Keep last 5 seconds (approx 5 chunks)
+                if (replayChunksRef.current.length > 5) {
+                    replayChunksRef.current.shift();
+                }
+            }
+        };
+        rec.start(1000); 
+        phantomRecorderRef.current = rec;
+    } catch (e) {
+        console.error("Phantom Recorder failed to start:", e);
+    }
   };
 
   const triggerPhantomReplay = (currentAlert: MedicalAlert) => {
@@ -111,30 +278,51 @@ function App() {
      if (Date.now() - lastAlertTimeRef.current < 10000) return;
      lastAlertTimeRef.current = Date.now();
 
-     if (replayChunksRef.current.length > 0) {
-         const blob = new Blob(replayChunksRef.current, { type: 'video/webm' });
-         const url = URL.createObjectURL(blob);
-         setReplayUrl(url);
-         setReplayReason(`${currentAlert.diagnosis}: ${currentAlert.symptoms.join(', ')}`);
-     }
+     // Use a slight timeout to ensure the buffer captures the event "in context"
+     setTimeout(() => {
+        if (replayChunksRef.current.length > 0) {
+            if (replayUrl) {
+                URL.revokeObjectURL(replayUrl);
+            }
+
+            // Create blob using the exact mime type we recorded with
+            const blob = new Blob(replayChunksRef.current, { 
+                type: recordingMimeTypeRef.current || 'video/webm' 
+            });
+            
+            const url = URL.createObjectURL(blob);
+            setReplayUrl(url);
+            setReplayReason(`${currentAlert.diagnosis}: ${currentAlert.symptoms.join(', ')}`);
+        }
+     }, 500);
+  };
+
+  const handleCloseReplay = () => {
+      if (replayUrl) {
+          URL.revokeObjectURL(replayUrl);
+          setReplayUrl(null);
+      }
   };
 
   const startLiveClient = async (stream: MediaStream) => {
     if (liveClientRef.current) {
         liveClientRef.current.disconnect();
     }
+    setConnectionError(null);
 
     const client = new LazarusLiveClient(
         (newAlert) => {
-            setAlert(newAlert);
-            if (newAlert.status === DiagnosisStatus.CRITICAL) {
-                triggerPhantomReplay(newAlert);
-            }
+            handleNewAlert(newAlert);
         },
-        (connected) => {
+        (connected, error) => {
             setIsConnected(connected);
+            if (error) {
+                setConnectionError(error);
+                console.warn("Lazarus Connection Issue:", error);
+            }
+            
+            // Only retry if we are not connected and didn't mean to stop
             if (!connected && !isIntentionalStop.current) {
-                console.warn("Live Client disconnected unexpectedly. Attempting reconnect...");
                 scheduleReconnect(stream, 'LIVE_CLIENT');
             }
         }
@@ -144,26 +332,26 @@ function App() {
         await client.connect();
         await client.startAudioStream(stream);
         liveClientRef.current = client;
-    } catch (e) {
+    } catch (e: any) {
         console.error("Failed to connect Live Client", e);
         setIsConnected(false);
+        setConnectionError(e.message || "Init Failed");
         scheduleReconnect(stream, 'LIVE_CLIENT');
     }
   };
 
   const startWebSocketServer = (stream: MediaStream) => {
-    // 1. Determine correct WebSocket URL for deployment
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const host = window.location.hostname === 'localhost' ? 'localhost:8000' : window.location.host;
     const wsUrl = `${protocol}//${host}/ws`;
 
     console.log("Connecting to Backend:", wsUrl);
+    setConnectionError(null);
     
     if (wsRef.current) {
         wsRef.current.close();
     }
     
-    // Stop previous audio recorder if it exists to prevent memory leaks
     if (wsRecorderRef.current && wsRecorderRef.current.state !== 'inactive') {
         wsRecorderRef.current.stop();
     }
@@ -173,30 +361,31 @@ function App() {
     ws.onopen = () => {
         console.log("Connected to Python Lazarus Backend");
         setIsConnected(true);
+        setConnectionError(null);
     };
 
     ws.onmessage = (event) => {
         try {
             const data = JSON.parse(event.data);
-            setAlert(data);
-            if (data.status === DiagnosisStatus.CRITICAL) {
-                triggerPhantomReplay(data);
-            }
+            handleNewAlert(data);
         } catch (e) {
             console.error("Failed to parse backend message", e);
         }
     };
     
-    ws.onclose = () => {
+    ws.onclose = (event) => {
         setIsConnected(false);
-        console.log("WebSocket Disconnected");
+        if (!event.wasClean) {
+             setConnectionError(`WS Disconnected (Code: ${event.code})`);
+        }
         if (!isIntentionalStop.current) {
              scheduleReconnect(stream, 'WEBSOCKET_SERVER');
         }
     };
 
     ws.onerror = (e) => {
-        console.error("WebSocket Error:", e);
+        console.error("WebSocket Error (See Network Tab)");
+        setConnectionError("WebSocket Connection Error");
     };
     
     wsRef.current = ws;
@@ -245,10 +434,13 @@ function App() {
   }, [isConnected, mode]);
 
   const captureAndSendFrameLive = () => {
-    const base64 = getFrameBase64();
-    if (base64 && liveClientRef.current) {
-        const data = base64.split(',')[1];
-        liveClientRef.current.sendVideoFrame(data);
+    // Only send if we have a valid client reference AND session
+    if (liveClientRef.current) {
+        const base64 = getFrameBase64();
+        if (base64) {
+            const data = base64.split(',')[1];
+            liveClientRef.current.sendVideoFrame(data);
+        }
     }
   };
 
@@ -287,7 +479,6 @@ function App() {
     <div className="relative w-full h-screen bg-black flex flex-col items-center justify-center overflow-hidden">
       <div className="scan-line"></div>
       
-      {/* Video Background */}
       <video 
         ref={videoRef} 
         className="absolute inset-0 w-full h-full object-cover opacity-60 grayscale contrast-125" 
@@ -295,20 +486,24 @@ function App() {
         playsInline
       />
       
-      {/* Hidden Canvas for processing */}
       <canvas ref={canvasRef} className="hidden" />
 
-      {/* HUD Layer */}
-      <HudOverlay alert={alert} isConnected={isConnected} mode={mode} />
+      {/* Pass history and analyser to HUD */}
+      <HudOverlay 
+        alert={alert} 
+        history={history}
+        isConnected={isConnected} 
+        mode={mode} 
+        error={connectionError} 
+        audioAnalyser={audioAnalyser}
+      />
 
-      {/* Phantom Replay Popup */}
       <PhantomReplay 
          videoUrl={replayUrl} 
          reason={replayReason} 
-         onClose={() => setReplayUrl(null)} 
+         onClose={handleCloseReplay} 
       />
 
-      {/* Booting Overlay */}
       {isBooting && (
           <div className="absolute inset-0 bg-black/90 z-[60] flex flex-col items-center justify-center text-[#00ff41] font-mono">
               <div className="text-4xl font-bold animate-pulse mb-4">INITIALIZING SYSTEM</div>
@@ -319,7 +514,6 @@ function App() {
           </div>
       )}
 
-      {/* Controls */}
       {!isStarted && !isBooting && (
         <div className="z-50 flex flex-col gap-4 items-center bg-black/90 p-8 border border-[#00ff41] rounded shadow-[0_0_50px_rgba(0,255,65,0.2)] backdrop-blur-md">
           <h1 className="text-6xl font-black tracking-widest text-[#00ff41] drop-shadow-[0_0_10px_#00ff41]">LAZARUS</h1>
@@ -347,12 +541,20 @@ function App() {
              <div className="text-red-500 text-xs border border-red-900 bg-red-900/20 p-2 w-full text-center">API_KEY REQUIRED FOR CLIENT MODE</div>
           )}
           
-          <button 
-            onClick={startSequence}
-            className="w-full py-4 mt-4 bg-[#00ff41] text-black font-black tracking-widest hover:bg-white hover:text-black transition-all duration-300 shadow-[0_0_20px_rgba(0,255,65,0.4)]"
-          >
-            ACTIVATE SYSTEM
-          </button>
+          <div className="flex flex-col gap-2 w-full mt-4">
+             <button 
+                onClick={() => startSequence(false)}
+                className="w-full py-4 bg-[#00ff41] text-black font-black tracking-widest hover:bg-white hover:text-black transition-all duration-300 shadow-[0_0_20px_rgba(0,255,65,0.4)]"
+            >
+                ACTIVATE SYSTEM
+            </button>
+            <button 
+                onClick={() => { setMode('SIMULATION'); startSequence(true); }}
+                className="w-full py-2 bg-transparent border border-[#00ff41]/50 text-[#00ff41]/50 font-bold tracking-widest hover:bg-[#00ff41]/10 hover:text-[#00ff41] text-xs transition-all"
+            >
+                RUN SIMULATION (DEMO)
+            </button>
+          </div>
         </div>
       )}
     </div>
