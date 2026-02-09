@@ -1,0 +1,8 @@
+{
+  "name": "Copy of Lazarus - AI Medical Guardian",
+  "description": "Real-time AI-augmented 911 operator assistant detecting medical emergencies via multimodal streams.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ]
+}
